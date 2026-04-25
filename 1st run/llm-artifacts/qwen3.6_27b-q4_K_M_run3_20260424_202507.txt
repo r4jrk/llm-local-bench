@@ -1,0 +1,75 @@
+### Design Overview
+
+KSeF imposes hard constraints: a global IP limit and a per-tenant NIP quota. In a SaaS architecture, the IP limit is a shared resource, creating a "noisy neighbor" risk. The design must isolate tenant failures while maximizing shared throughput.
+
+**Architecture: RabbitMQ + Redis Token Bucket**
+1.  **Queue Layer:** RabbitMQ with a Priority Exchange. Invoices are published to `ksef.requests` with priority levels (e.g., urgent vs. background). This allows QoS management but does not bypass rate limits.
+2.  **State Layer:** Redis Cluster backing a distributed Token Bucket implementation. Two key families: `limit:ip:global` and `limit:nip:{tenant_id}`.
+3.  **Worker Pool:** Spring Boot consumers pull messages atomically. Before calling KSeF, the worker executes a Lua script in Redis to check both limits simultaneously. This prevents race conditions and reduces round-trips.
+
+### Pseudocode
+
+```python
+class KSeFWorker:
+    # Lua script ensures atomicity of dual-check
+    CHECK_LUA = """
+    local ip_limit = tonumber(ARGV[1])
+    local nip_limit = tonumber(ARGV[2])
+    local now = tonumber(ARGV[3])
+    
+    local ip_key = 'limit:ip:global'
+    local nip_key = 'limit:nip:' .. KEYS[1]
+    
+    -- Simplified Token Bucket refill logic
+    local function consume(key, limit)
+        local bucket = redis.call('hmget', key, 'tokens', 'last_refill')
+        local tokens = tonumber(bucket[1]) or limit
+        local last = tonumber(bucket[2]) or now
+        local refill = math.min(limit, tokens + (now - last) * REFILL_RATE)
+        if refill > 0 then
+            redis.call('hset', key, 'tokens', refill - 1, 'last_refill', now)
+            return true
+        end
+        redis.call('hset', key, 'last_refill', now)
+        return false
+    end
+
+    local ip_ok = consume(ip_key, ip_limit)
+    local nip_ok = consume(nip_key, nip_limit)
+    return (ip_ok and nip_ok) and 1 or 0
+    """
+
+    def process(self, message):
+        allowed = redis.eval(CHECK_LUA, keys=[message.nip], args=[MAX_IP, MAX_NIP, now()])
+        
+        if allowed:
+            response = ksef_client.post(message)
+            self.handle_success(response, message)
+        else:
+            # Rate limited: requeue with exponential backoff
+            delay = self.calc_backoff(message.retry_count)
+            self.requeue_with_delay(message, delay)
+
+    def handle_response(self, resp, msg):
+        if resp.status == 429:
+            # KSeF 429: Respect Retry-After or aggressive backoff
+            self.requeue_with_delay(msg, max(resp.retry_after, self.base_delay))
+        elif resp.status >= 500:
+            self.requeue_with_delay(msg, self.calc_backoff(msg.retry_count))
+        elif resp.retry_count > MAX_RETRIES:
+            self.send_to_dlq(msg)
+```
+
+### Retry & Backoff Strategy
+*   **Backoff:** Exponential with jitter: `delay = min(max_delay, base * 2^attempt + random())`.
+*   **Status Codes:** 429 triggers a mandatory wait (prefer `Retry-After` header). 5xx triggers standard backoff.
+*   **Circuit Breaker:** If KSeF returns 503 or 429 consistently for a specific NIP, pause that tenant's queue for a fixed recovery window to prevent storming.
+*   **Dead Letter Queue (DLQ):** Messages exceeding `MAX_RETRIES` move to DLQ for manual inspection and idempotency key rotation.
+
+### Tradeoffs
+1.  **IP Contention:** Since the IP limit is global, a single tenant bursting traffic can throttle all others. *Mitigation:* Implement fair-share scheduling in the worker pool or dynamic IP rotation (higher infra cost).
+2.  **Redis Latency:** Atomic Lua checks add latency to every request. *Tradeoff:* Higher consistency vs. throughput. For KSeF, consistency is non-negotiable; caching limits locally is risky due to drift.
+3.  **Priority Starvation:** Priority queues can starve low-priority messages. *Mitigation:* Weighted scheduling or limiting the burst capacity of high-priority lanes.
+4.  **Complexity:** Managing dual limits and backoff logic increases operational overhead. Monitoring must alert on DLQ growth and Redis `limit` key anomalies.
+
+This design ensures compliance, isolates tenant impact, and provides robust recovery mechanisms suitable for production SaaS.

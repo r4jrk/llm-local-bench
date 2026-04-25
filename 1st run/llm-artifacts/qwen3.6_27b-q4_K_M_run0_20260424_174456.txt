@@ -1,0 +1,62 @@
+**Architecture Overview**
+
+For a multi-tenant SaaS integrating with KSeF, reliability and strict limit adherence are paramount. I propose a decoupled architecture using **RabbitMQ** for buffering and **Redis** for distributed rate limiting. This ensures client requests are acknowledged immediately while KSeF interactions are managed asynchronously with backpressure control.
+
+**Queue Design**
+To balance tenant isolation with operational scalability, use **sharded queues** derived from a hash of the NIP (`kseb_shard_{0..N}`). This prevents the "noisy neighbor" problem where one tenant blocks others, while avoiding the management overhead of thousands of per-tenant queues. Producers publish messages with an `idempotencyKey` and NIP/IP metadata. The queue acts as a shock absorber, protecting the SaaS from KSeF latency spikes.
+
+**Rate Limiting (IP+NIP)**
+KSeF enforces limits per IP and per NIP. Implement a distributed sliding window using Redis with a **Lua script** for atomic check-and-increment operations. The key structure `lim:{ip}:{nip}:{window}` ensures composite limiting. The consumer acquires a permit immediately before invoking the API. If the limit is exceeded, the message is requeued with a delay calculated from the window's reset time. This prevents CPU waste on throttled calls and ensures we never exceed the budget.
+
+**Retry & Backoff Strategy**
+Integrate **Resilience4j** for resilience patterns:
+1.  **Circuit Breaker:** Opens on bursts of 429/5xx errors to prevent cascading failures and protect KSeF from hammering.
+2.  **Selective Retries:** Only retry transient errors (429, 502, 503, 504). Client errors (4xx) move directly to the **Dead Letter Queue (DLQ)**.
+3.  **Exponential Backoff with Jitter:** On 429, parse `Retry-After` headers if present; otherwise, apply $base \cdot 2^{attempt}$ with randomized jitter. Cap retries at 5 to avoid infinite loops.
+4.  **Idempotency:** KSeF requires unique request IDs. The consumer must verify the `idempotencyKey` against a fast cache or DB to handle queue redeliveries safely, ensuring exactly-once processing semantics.
+
+**Pseudocode**
+
+```java
+@Service
+public class KSeFConsumer {
+    private final RabbitTemplate rmq;
+    private final RedisTemplate redis;
+    private final CircuitBreaker breaker;
+
+    @RabbitListener(queues = "kseb_shard_*")
+    public void handle(KSeFMsg msg) {
+        // Atomic Lua check: returns true if limit available, false otherwise
+        boolean allowed = redis.execute(luaSlidingWindowScript, msg.ip, msg.nip);
+        
+        if (!allowed) {
+            long delayMs = redis.getRemainingWindow(msg.ip, msg.nip);
+            rmq.requeue(msg, delayMs); // Uses delayed exchange
+            return;
+        }
+
+        try {
+            Response res = breaker.executeSupplier(() -> ksebClient.send(msg));
+            persistResponse(res);
+        } catch (RateLimitException e) {
+            // 429 handling
+            long wait = parseRetryAfter(e) ?? backoff.next();
+            rmq.requeue(msg, wait);
+        } catch (RetryableException e) {
+            rmq.requeue(msg, backoff.next());
+        } catch (Exception e) {
+            rmq.toDLQ(msg, e); // Alert on DLQ arrival
+        }
+    }
+}
+```
+
+**Tradeoffs & Discussion**
+
+1.  **Sharding vs. Per-Tenant Queues:** Sharding reduces RabbitMQ overhead but allows intra-shard contention. *Mitigation:* Tune shard count based on total throughput; analyze load distribution to rebalance if needed.
+2.  **Redis Dependency:** Adds latency and a critical dependency. In-memory limiters risk under-counting during deployments, potentially triggering KSeF account bans. *Decision:* Redis Cluster/Sentinel is required; the risk of bans outweighs the infrastructure cost.
+3.  **Delayed Exchanges vs. Consumer Sleep:** Using a delayed exchange keeps the message in RabbitMQ, freeing the consumer thread. Consumer sleep holds threads, reducing concurrency. *Tradeoff:* Delayed exchanges require a RabbitMQ plugin but offer superior thread efficiency under heavy throttling.
+4.  **Complexity vs. Safety:** This design adds significant operational complexity (queue management, Redis, idempotency checks). However, direct integration risks SaaS-wide outages due to KSeF suspension. The buffer and distributed limiting guarantee compliance and availability.
+5.  **Observability:** Implement metrics for `rate_limit_usage_ratio`. Alert at 80% utilization to proactively scale or notify tenants. Export KSeF latency histograms and trace requests across the queue boundary to correlate delays.
+
+This architecture ensures strict adherence to KSeF constraints while maintaining high availability and fairness for all SaaS tenants.

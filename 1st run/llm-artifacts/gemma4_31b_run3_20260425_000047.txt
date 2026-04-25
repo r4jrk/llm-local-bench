@@ -1,0 +1,54 @@
+As a senior engineer, I recommend a **Distributed Asynchronous Worker Pattern**. Since KSeF imposes limits on both the source IP and the entity (NIP), a synchronous API call is too risky; we must decouple request submission from execution using a message broker.
+
+### Architecture Overview
+1.  **API Gateway/Service**: Receives the invoice, persists it to the DB as `PENDING`, and pushes a message to the queue.
+2.  **Message Broker (RabbitMQ/Kafka)**: Acts as a buffer. I suggest separate queues per priority or a single partitioned queue to ensure order per NIP.
+3.  **Worker Pool**: Consumes messages and interacts with the **Distributed Rate Limiter**.
+4.  **Rate Limiter (Redis)**: Uses a **Token Bucket** algorithm. It tracks two keys per request: `rate_limit:ip` and `rate_limit:nip:{nip}`.
+
+### Retry & Backoff Strategy
+When a `429 Too Many Requests` is received or the Redis bucket is empty:
+- **Exponential Backoff**: Retry at $2^n$ intervals (e.g., 1s, 2s, 4s...).
+- **Jitter**: Add random milliseconds to prevent "thundering herd" synchronization.
+- **Dead Letter Queue (DLQ)**: After $X$ retries, move the message to a DLQ for manual intervention or alerting.
+
+### Pseudocode Implementation
+
+```java
+// Simplified Worker Logic
+@RabbitListener(queues = "ksef-outbound")
+public void processInvoice(InvoiceTask task) {
+    String ip = System.getProperty("server.ip");
+    String nip = task.getNip();
+
+    // Atomic check for both limits using Lua script in Redis
+    if (rateLimiter.acquire(ip, nip)) {
+        try {
+            ksefClient.sendInvoice(task);
+        } catch (RateLimitException e) {
+            handleRetry(task, e);
+        }
+    } else {
+        // Re-queue with delay (TTL) if tokens are unavailable
+        retryTemplate.requeueWithDelay(task);
+    }
+}
+
+// Redis Lua Script for Atomic Dual-Check
+// if redis.call('get', KEYS[1]) < LIMIT and redis.call('get', KEYS[2]) < LIMIT then
+//    redis.call('incr', KEYS[1]); redis.call('incr', KEYS[2]); return 1;
+// end
+// return 0;
+```
+
+### Trade-offs & Considerations
+
+| Trade-off | Decision | Reasoning |
+| :--- | :--- | :--- |
+| **Latency vs. Reliability** | Reliability | KSeF is a legal requirement. Asynchronous processing increases latency but ensures no invoice is lost due to 429s. |
+| **Redis vs. Local Cache** | Redis | Local caching fails in a multi-node Spring Boot cluster; centralized state is mandatory for IP-based limits. |
+| **Queue Depth vs. UX** | Queue Depth | High volumes may lead to "lag" in invoice submission. We must provide a status polling API/Webhook to the client. |
+| **Strict vs. Soft Limits** | Soft Limits | We implement a "buffer" (e.g., limit at 90% of KSeF's actual limit) to handle slight clock drifts or unexpected API fluctuations. |
+
+### Summary
+The system ensures compliance by treating the KSeF API as a scarce resource. By combining **Redis Lua scripts** for atomic limit checking and **RabbitMQ** for flow control, we transform a fragile synchronous dependency into a resilient pipeline.

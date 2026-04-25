@@ -1,0 +1,94 @@
+**Rate Limiting System for Spring Boot + KSeF Integration**
+
+To reliably integrate with the Polish KSeF (Krajowy System Informatyczny podatku od towarów i usług) API, we implement a layered rate-limiting strategy with IP+NIP-aware throttling, exponential backoff, and a decoupled request queue.
+
+---
+
+**Core Components**
+
+1. **Rate Limit Registry (In-Memory + Redis)**  
+   Store per-IP and per-NIP request counters with sliding windows (e.g., 60s/5min/24h limits) in Redis (e.g., `RATE_LIMIT:IP:{ip}:NIP:{nip}:window:{ts}` with TTL). Redis ensures horizontal scalability across pods.
+
+2. **Spring Gateway/Interceptor Layer**  
+   In `RateLimitingFilter`, parse IP (client or X-Forwarded-For) and NIP (from Authorization header or request payload). For each request:  
+   - Increment Redis counters for IP, NIP, and combined IP+NIP tuples  
+   - Reject if *any* limit exceeded (HTTP 429 with `Retry-After` header)  
+   - Otherwise, enqueue the request
+
+3. **Queue Architecture (Async)**  
+   - Use **Redis Streams** (or RabbitMQ) as the queue backend  
+   - Producers (web requests) enqueue with metadata (IP, NIP, payload, timestamp)  
+   - Consumers (Spring `@KafkaListener` or `TaskExecutor`) drain the queue with *per-customer* rate limiting enforced via Redis tokens (Leaky Bucket per NIP/IP combo)
+
+4. **Retry & Backoff Strategy**  
+   On KSeF 429/5xx:  
+   - Extract `Retry-After` if present  
+   - Else, apply exponential backoff: `delay = base * 2^retry_count` (max 5 min), with jitter: `delay ±10%`  
+   - Retry attempts stored in queue metadata; drop after 5 failures  
+   - Dead Letter Queue (DLQ) for permanent failures (logged + monitored)
+
+---
+
+**Pseudocode**
+
+```java
+// RateLimitingFilter
+public Mono<ResponseEntity> filter(ServerWebExchange exchange, GatewayFilterChain chain) {
+  String ip = getClientIp(exchange);
+  String nip = extractNip(exchange);
+  
+  String key = "RATE_LIMIT:" + ip + ":" + nip;
+  long now = System.currentTimeMillis();
+  long window = 60_000; // 1-minute window
+  
+  // Redis pipeline: increment + TTL
+  RedisScript<Long> script = RedisScript.of("..."); // Lua script for atomicity
+  Long count = redis.execute(script, keys(key), String.valueOf(now), String.valueOf(window));
+  
+  if (count > LIMIT_PER_MINUTE) {
+    long retryAfter = (window - (now % window)) / 1000;
+    return Mono.just(ResponseEntity.status(429)
+        .header("Retry-After", String.valueOf(retryAfter))
+        .build());
+  }
+  
+  // Enqueue to Redis Stream
+  Map<String, Object> payload = Map.of(
+      "ip", ip, "nip", nip, "payload", body, "retries", 0,
+      "nextRetry", now
+  );
+  redisStream.add(key + ":queue", payload);
+  return Mono.just(ResponseEntity.accepted().build());
+}
+
+// Consumer (async)
+@Scheduled(fixedDelay = 2000)
+public void processQueue() {
+  List<Map<String, Object>> items = redisStream.read("group", "consumer");
+  for (Map<String, Object> item : items) {
+    if (exceedsDailyLimit(item.get("nip"))) {
+      dlq.add(item); continue;
+    }
+    
+    try {
+      ksefClient.send(item.get("payload"));
+      redisStream.ack(item);
+    } catch (RateLimitException e) {
+      long delay = calculateBackoff(item, e);
+      item.put("nextRetry", System.currentTimeMillis() + delay);
+      item.put("retries", item.get("retries") + 1);
+      redisStream.add(item, delay); // requeue with delay
+    }
+  }
+}
+```
+
+---
+
+**Tradeoffs**  
+- **Consistency vs. Latency**: Redis ensures strong rate limits but adds ~2–5ms/req. Acceptable for KSeF’s ~5s latency.  
+- **Queue Latency**: Async processing decouples ingestion from API calls but adds delay (acceptable for non-real-time tax data).  
+- **Accuracy**: Sliding windows in Redis are approximate (cardinality per key); acceptable for rate limiting.  
+- **Complexity**: Redis Streams add operational overhead vs. in-memory queues (which lack scalability).  
+
+**Final Note**: For high-volume tenants, consider per-customer rate limit tiers stored in DB (e.g., enterprise = 10x quota), dynamically loaded via Spring Cache. Monitor `KsefRetryCounter` metrics in Prometheus.

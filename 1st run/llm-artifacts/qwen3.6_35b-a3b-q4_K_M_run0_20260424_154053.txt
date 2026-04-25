@@ -1,0 +1,37 @@
+A production-grade rate limiter for a KSeF-integrated Spring Boot SaaS must enforce dual-dimension limits, decouple synchronous API calls from asynchronous processing, and guarantee tenant isolation. We implement a Redis-backed token bucket, priority message queue, and Resilience4j retry circuit.
+
+**Rate Limiting (IP + NIP)**
+KSeF enforces strict quotas per public IP and per registered entity (NIP). We track both using atomic Redis EVAL scripts. Each request acquires two independent token buckets: `ip:<client_ip>` and `nip:<tenant_nip>`. Limits are tenant-tier configurable (e.g., Starter: 10/min/IP, 50/min/NIP). A Spring `OncePerRequestFilter` executes the Lua script synchronously; if either bucket exhausts, a `429` is returned immediately. For cloud/NAT environments where multiple tenants share an IP, we add a composite key `ip:<ip>:nip:<nip>` to prevent cross-tenant starvation.
+
+**Queue Architecture**
+Validated requests never hit KSeF synchronously. Spring’s `@Async` controller pushes to RabbitMQ (preferred for header routing) or Kafka. Each message carries `requestId`, `tenantId`, `nip`, and an idempotency key. Consumers partition by `nip` to guarantee per-entity ordering and strict rate compliance. A Dead Letter Queue (DLQ) captures messages failing after maximum retries. Priority routing ensures urgent financial submissions bypass background processing during compliance windows.
+
+**Retry & Backoff Strategy**
+Consumers wrap KSeF HTTP calls in Resilience4j’s `Retry` and `CircuitBreaker`. Base config: exponential backoff (`2s → 30s`) with `0.5` jitter. On `429`, consumers parse `Retry-After` and override delay. After N consecutive `5xx`/`429` failures, the circuit opens, pausing consumption until KSeF recovers. Idempotency keys prevent duplicate submissions during retries.
+
+**Pseudocode**
+```java
+public CompletableFuture<Submission> submit(KsefRequest req) {
+    String ipKey = "ksef:ip:" + req.getIp();
+    String nipKey = "ksef:nip:" + req.getNip();
+    long[] limits = {req.getIpLimit(), req.getNipLimit()};
+    
+    // Atomic Redis rate check (Lua)
+    Long[] remaining = redis.execute(rateLimitScript, KEYS, limits);
+    if (remaining[0] < 0 || remaining[1] < 0) {
+        throw new RateLimitExceededException("KSeF quota exhausted");
+    }
+    
+    // Async queue submission
+    rabbitTemplate.convertAndSend("ksef.submit", req.toMessage());
+    return CompletableFuture.completedFuture(Submission.PENDING);
+}
+```
+
+**Tradeoffs**
+- *Latency vs. Reliability:* Redis adds ~1–2ms but prevents cascading KSeF blocks. Queue decoupling absorbs spikes but introduces eventual consistency.
+- *Tenant Isolation:* NIP limits protect against noisy neighbors, but NAT shared IPs require careful key design to avoid false throttling.
+- *Complexity vs. Maintainability:* Dual buckets + queues + DLQ increase operational overhead but are mandatory for SaaS fairness. Single-consumer per NIP guarantees order but limits scaling; sharding by NIP range mitigates this.
+- *Compliance Risk:* Overly aggressive retry jitter may still trigger KSeF guards. Integrating dynamic `Retry-After` parsing and graceful degradation (fallback templates) is critical for production stability.
+
+This architecture balances KSeF compliance, multi-tenant fairness, and resilient async processing.

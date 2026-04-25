@@ -1,0 +1,55 @@
+To design a robust rate-limiting system for KSeF integration, we must address two dimensions: **Infrastructure protection** (IP-based) and **Compliance** (NIP-based). Since KSeF enforces limits per taxpayer (NIP), our system must ensure one heavy client doesn't exhaust the quota for others, while also preventing our outbound IP from being blacklisted.
+
+### Architecture: Distributed Token Bucket
+I propose an **Asynchronous Producer-Consumer** pattern using **Redis** for state and **RabbitMQ** for orchestration.
+
+1.  **The Producer (Spring Boot API):** Receives the request, validates the NIP, and pushes a "KSeF Task" into a primary `ksef_request_queue`.
+2.  **The Rate Limiter (Redis):** Uses a Lua script to implement a **Token Bucket** algorithm. We maintain two sets of keys: `ratelimit:ip:<ip_address>` and `ratelimit:nip:<nip_id>`.
+3.  **The Consumer (Worker Service):** Pulls tasks from the queue. It checks the Redis rate limiter before calling KSeF.
+4.  **The Retry Mechanism (Delayed Exchange):** If a 429 (Too Many Requests) is encountered or the local limit is hit, the task is moved to a **Delayed Exchange** (RabbitMQ DLX/TTL) for exponential backoff.
+
+### Pseudocode
+
+```java
+// Redis Lua Script logic (simplified)
+String luaScript = "local current = redis.call('get', KEYS[1]); " +
+                   "if current and tonumber(current) >= tonumber(ARGV[1]) then return 0 " +
+                   "else redis.call('incr', KEYS[1]); redis.call('expire', KEYS[1], 60); return 1 end";
+
+@Service
+public class KsefWorker {
+    @RabbitListener(queues = "ksef_request_queue")
+    public void processTask(KsefTask task) {
+        // 1. Check both IP and NIP limits
+        boolean allowed = rateLimiter.isAllowed(task.getIp(), task.getNip());
+
+        if (allowed) {
+            try {
+                ksefClient.sendInvoice(task.getData());
+                updateSuccessMetrics(task);
+            } catch (KsefRateLimitException e) {
+                // KSeF returned 429: Trigger Exponential Backoff
+                retryService.requeueWithBackoff(task, task.getRetryCount() + 1);
+            }
+        } else {
+            // Local limit hit: Requeue with a fixed short delay
+            retryService.requeueWithDelay(task, 5000); 
+        }
+    }
+}
+```
+
+### Retry & Backoff Strategy
+We will use **Exponential Backoff with Jitter**.
+*   **Backoff Formula:** $Delay = Base \times 2^{retry\_count} + random\_jitter$
+*   **Implementation:** Use RabbitMQ `x-delay` header. If `retry_count > 5`, move the message to a **Dead Letter Queue (DLQ)** for manual intervention/alerting.
+
+### Tradeoffs
+
+| Component | Advantage | Disadvantage |
+| :--- | :--- | :--- |
+| **Redis (Global State)** | High performance; ensures consistency across multiple Spring Boot nodes. | Adds an external dependency; potential single point of failure if not clustered. |
+| **Async Queue** | Decouples API latency from KSeF latency; handles spikes gracefully. | Increased system complexity; "Eventual Consistency" (users don't get instant confirmation). |
+| **NIP + IP Limits** | Granular control; protects both business logic and infra. | Higher overhead in Redis memory and more complex Lua logic. |
+
+**Summary:** This architecture prioritizes **reliability and compliance**. By using an asynchronous worker with Redis-backed token buckets, we transform volatile KSeF API responses into a controlled, predictable stream of outbound traffic.

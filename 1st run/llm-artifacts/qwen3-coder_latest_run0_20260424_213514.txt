@@ -1,0 +1,94 @@
+## Rate Limiting System for Spring Boot SaaS with KSeF Integration
+
+### Architecture Overview
+
+I'll design a distributed rate limiting system using Redis with a token bucket algorithm for both IP+NIP combinations and global limits.
+
+```java
+@Component
+public class RateLimitingService {
+    private final RedisTemplate<String, String> redisTemplate;
+    
+    public boolean isAllowed(String ip, String nip, String apiKey) {
+        String key = "rate_limit:ip:" + ip + ":nip:" + nip;
+        String globalKey = "rate_limit:global:" + apiKey;
+        
+        // Check IP+NIP limit (100 requests/minute)
+        if (!checkRateLimit(key, 100, 60)) return false;
+        
+        // Check global limit (1000 requests/minute)
+        if (!checkRateLimit(globalKey, 1000, 60)) return false;
+        
+        return true;
+    }
+    
+    private boolean checkRateLimit(String key, int limit, int windowSeconds) {
+        String script = "local current = redis.call('GET', KEYS[1]) " +
+                       "if current and tonumber(current) >= tonumber(ARGV[1]) then " +
+                       "return 0 " +
+                       "else " +
+                       "redis.call('INCR', KEYS[1]) " +
+                       "redis.call('EXPIRE', KEYS[1], ARGV[2]) " +
+                       "return 1 " +
+                       "end";
+        
+        return (Long) redisTemplate.execute(
+            new DefaultRedisScript<>(script, Long.class),
+            Collections.singletonList(key),
+            String.valueOf(limit),
+            String.valueOf(windowSeconds)
+        ) == 1L;
+    }
+}
+```
+
+### Queue Architecture
+
+Implement a bounded queue with exponential backoff:
+```java
+@Async
+public void processWithRetry(String request) {
+    int attempts = 0;
+    int maxAttempts = 5;
+    Duration backoff = Duration.ofSeconds(1);
+    
+    while (attempts < maxAttempts) {
+        try {
+            // Check rate limits before processing
+            if (rateLimitingService.isAllowed(ip, nip, apiKey)) {
+                ksefClient.process(request);
+                return;
+            }
+        } catch (RateLimitExceededException e) {
+            attempts++;
+            if (attempts >= maxAttempts) throw e;
+            
+            // Exponential backoff with jitter
+            Duration delay = backoff.plusMillis(ThreadLocalRandom.current().nextInt(1000));
+            Thread.sleep(delay.toMillis());
+            backoff = backoff.multipliedBy(2);
+        }
+    }
+}
+```
+
+### Tradeoffs
+
+**Pros:**
+- Redis provides fast, distributed rate limiting
+- Token bucket algorithm allows burst handling
+- Queue architecture prevents system overload
+- Configurable retry/backoff prevents cascading failures
+
+**Cons:**
+- Redis dependency adds operational complexity
+- Network latency for Redis calls
+- Memory usage scales with concurrent users
+- Potential for false positives during Redis failures
+
+**Alternative approaches:** 
+- In-memory limits for single instances (simpler but not scalable)
+- Circuit breaker patterns for degraded service
+- Pre-warming rate limit buckets to reduce cold start issues
+
+The system balances performance, reliability, and cost while maintaining SaaS scalability requirements.

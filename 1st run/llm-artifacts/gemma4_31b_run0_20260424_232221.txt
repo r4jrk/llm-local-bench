@@ -1,0 +1,64 @@
+To handle KSeF's strict API constraints, we must shift from a synchronous "Request-Response" model to an **Asynchronous Buffered Pipeline**. Since KSeF limits both by NIP (Tenant) and IP (Infrastructure), a distributed rate limiter is mandatory to prevent 429 errors across multiple pods.
+
+### 1. High-Level Architecture
+We will use a **Producer-Consumer** pattern with **Redis** as the state store for rate limits and **RabbitMQ/Kafka** as the orchestration layer.
+
+1.  **Producer**: Receives the invoice request, persists it to the DB as `PENDING`, and pushes a message to the `ksef-submission-queue`.
+2.  **Worker (Consumer)**: Pulls messages and passes them through a **Dual-Key Rate Limiter**.
+3.  **Rate Limiter**: Uses a **Token Bucket** algorithm in Redis. It checks two keys before allowing the call: `rate_limit:nip:{nip}` and `rate_limit:ip:{ip}`.
+4.  **KSeF Client**: Executes the API call.
+
+### 2. Retry & Backoff Strategy
+If the API returns a `429 Too Many Requests` or `5xx` error:
+- **Exponential Backoff**: Requeue the message with a delay ($2^n \times \text{base\_delay}$).
+- **Jitter**: Add a random offset to prevent "thundering herd" synchronization.
+- **Dead Letter Queue (DLQ)**: After $X$ retries, move the message to a DLQ for manual intervention or alerting.
+
+### 3. Pseudocode
+
+```java
+@Service
+public class KSeFSubmissionWorker {
+    @Autowired private RedisRateLimiter rateLimiter;
+    @Autowired private KSeFClient client;
+    @Autowired private MessageQueue queue;
+
+    @RabbitListener(queues = "ksef-submission-queue")
+    public void process(InvoiceTask task) {
+        // 1. Check both limits (NIP and IP)
+        if (rateLimiter.isAllowed("nip:" + task.getNip()) && 
+            rateLimiter.isAllowed("ip:global_outbound")) {
+            
+            try {
+                client.submit(task);
+            } catch (RateLimitException e) {
+                handleRetry(task, e);
+            }
+        } else {
+            // Requeue with a short delay if tokens are exhausted
+            queue.requeueWithDelay(task, 5000); 
+        }
+    }
+
+    private void handleRetry(InvoiceTask task, Exception e) {
+        int attempts = task.getRetryCount();
+        if (attempts < MAX_RETRIES) {
+            long delay = calculateExponentialBackoff(attempts);
+            queue.requeueWithDelay(task, delay);
+        } else {
+            queue.sendToDLQ(task);
+        }
+    }
+}
+```
+
+### 4. Trade-offs & Discussion
+
+| Trade-off | Decision | Justification |
+| :--- | :--- | :--- |
+| **Latency vs. Reliability** | Reliability | Invoice submission is not real-time critical; ensuring delivery via queues is more important than a <200ms response. |
+| **Redis vs. Local Cache** | Redis | Local (In-memory) limiting fails in a scaled Spring Boot environment; we need a global view of IP/NIP usage. |
+| **Token Bucket vs. Fixed Window** | Token Bucket | Avoids the "burst" at the start of a window, providing a smoother traffic flow to government servers. |
+| **Complexity vs. Control** | High Complexity | Adding queues and Redis increases infra overhead but is the only way to guarantee SLA for a SaaS with thousands of tenants. |
+
+**Key Consideration:** If KSeF introduces a "Header-based" quota (returned in the response), the worker should dynamically update the Redis bucket capacity to adapt to changing limits in real-time.

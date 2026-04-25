@@ -1,0 +1,29 @@
+A production-grade KSeF integration requires decoupling request ingestion from external API execution. The system accepts client payloads, validates schemas, assigns a correlation ID, and immediately returns `202 Accepted`. Work is pushed to a durable queue, where a dedicated consumer pool processes requests while strictly enforcing KSeF’s per-IP and per-NIP quotas.
+
+**Dual-Key Rate Limiting**
+I recommend a distributed sliding window log backed by Redis. Each outbound call is evaluated against two independent quotas: one keyed by `IP` and another by `NIP`. A single Lua script atomically prunes expired entries, checks both counters, increments if under quota, and returns `ALLOW` or `DENY` with a precise `Retry-After` delta. This prevents race conditions during burst traffic and matches KSeF’s strict throttling model.
+
+**Queue Architecture**
+Kafka provides durability, replayability, and partition parallelism. Messages are partitioned by `NIP` using a consistent hash, serializing requests per taxpayer and preventing cross-tenant quota bleeding. Each record carries the payload, originating IP, NIP, priority tier, and correlation ID. Spring Cloud Stream consumers poll messages, validate rate limits, invoke KSeF, and persist results. Backpressure is handled via dynamic consumer scaling and explicit lag alerting. Exhausted messages route to a dead-letter topic.
+
+**Retry & Backoff Strategy**
+Transient failures (429, 5xx) trigger exponential backoff with full jitter: `delay = min(base * 2^attempt, max_delay) + random(0, max_delay/2)`. I cap retries at 4. A Resilience4j circuit breaker wraps the HTTP client; it opens after consecutive failures, instantly rejecting new dispatches until recovery. This prevents thundering herds during KSeF degradation. Deterministic 4xx errors bypass retry logic and fail fast.
+
+**Pseudocode**
+```
+processMessage(msg) {
+  limitResult = redisRateLimiter.check(msg.ip, msg.nip)
+  if limitResult.allowed:
+    response = ksefClient.call(msg.payload)
+    if response.status in [429, 500, 502, 503]:
+      delay = exponentialWithJitter(msg.retryCount, base=1s, cap=30s)
+      queue.retry(msg, delay, msg.retryCount + 1)
+    else:
+      storeResult(msg.correlationId, response)
+  else:
+    queue.retry(msg, limitResult.retryAfter, msg.retryCount)
+}
+```
+
+**Tradeoffs**
+Redis introduces ~3ms latency per dispatch but guarantees cluster-wide consistency and crash recovery. In-memory limiters are faster but shard poorly across pods. NIP partitioning ensures tenant isolation yet risks hot partitions for heavy users; mitigations include range-based sub-partitioning or adaptive routing. Async queuing improves throughput and shields against upstream outages, but increases latency and requires polling endpoints for client visibility. Exponential backoff conserves quota capacity but delays error propagation. Circuit breakers stop cascading failures but sacrifice temporary availability during provider degradation. This architecture favors resilience, precise quota adherence, and multi-tenancy over synchronous speed.

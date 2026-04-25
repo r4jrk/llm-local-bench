@@ -1,0 +1,27 @@
+For a Spring Boot SaaS interfacing with KSeF, I’d implement a layered, decoupled throttling architecture. KSeF enforces strict quotas per customer (NIP) and per source IP. Violations trigger temporary blocks, so proactive enforcement is mandatory.
+
+**Rate Limiting (IP + NIP)**  
+I’d deploy a distributed sliding-window counter using Redis. Each request builds a composite key: `rl:ip:{client_ip}` and `rl:nip:{tax_id}`. A single Redis Lua script atomically increments both counters, checks them against configured quotas, and returns `{allowed: true/false}`. This avoids race conditions and ensures consistent enforcement across scaled Spring Boot instances. Quotas are configured dynamically via Spring Cloud Config to adapt to KSeF policy changes without redeployment.
+
+**Retry & Backoff Strategy**  
+HTTP interactions are wrapped in Resilience4j Retry. On a `429 Too Many Requests`, the circuit extracts the `Retry-After` header. I apply exponential backoff (base 1s, max 60s) with ±20% jitter to prevent thundering herds. Crucially, retries only proceed if the Redis limiter re-evaluates and permits the request. Failed evaluations reschedule the task into a delay queue rather than failing the endpoint.
+
+**Queue Architecture**  
+Synchronous calls are replaced by an async pipeline. Spring Boot serializes payloads to RabbitMQ with message headers `x-rate-key-ip` and `x-rate-key-nip`. A dedicated consumer service polls RabbitMQ, re-validates Redis counters, and forwards approved requests to KSeF. Messages that exceed limits or fail validation after max retries are routed to a Dead Letter Queue (DLQ) for manual inspection. NIP-scoped priority queues prevent high-volume tenants from starving low-volume compliance tasks.
+
+**Pseudocode**
+```java
+List<String> keys = List.of("rl:ip:" + ip, "rl:nip:" + nip);
+Long[] limits = config.getQuotas(ip, nip);
+Boolean allowed = redisScript.eval(keys, limits);
+
+if (Boolean.FALSE.equals(allowed)) {
+    long delay = backoff.computeDelay(HttpStatus.TOO_MANY_REQUESTS);
+    delayQueue.reschedule(task, delay);
+    return;
+}
+ksefClient.submitAsync(payload);
+```
+
+**Tradeoffs & Considerations**  
+Redis Lua guarantees atomicity but adds ~1–2ms latency versus in-memory limiters; this is acceptable given SaaS scale and accuracy requirements. RabbitMQ decouples producers from KSeF stability but sacrifices real-time responses and requires robust monitoring. Strict IP+NIP limits may block legitimate users behind NAT/public gateways; mitigation includes parsing `X-Forwarded-For` and validating NIP via the official tax registry. Finally, maintaining per-key counters increases Redis memory pressure; implementing key expiration (TTL = quota window + buffer) and periodic cleanup jobs preserves performance. This design balances KSeF compliance, system resilience, and tenant isolation while remaining operationally observable via Micrometer metrics.

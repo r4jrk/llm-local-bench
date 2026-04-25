@@ -1,0 +1,63 @@
+To handle KSeF (Krajowy System e-Faktur) integration, we cannot simply block requests; we must manage "backpressure." Since KSeF enforces strict, non-negotiable limits, a synchronous architecture will lead to cascading failures. We need a **Distributed Token Bucket** pattern paired with an **Asynchronous Worker** pattern.
+
+### Proposed Architecture
+
+1.  **Rate Limiter Layer (Redis):** We use Redis to track limits using a composite key: `rate_limit:{IP}:{NIP}`. The **Token Bucket algorithm** is ideal here to allow for small bursts while maintaining a steady average rate.
+2.  **Ingress (Producer):** A Spring Boot REST controller receives the request. It checks the Redis bucket.
+    *   **If allowed:** The request is converted into a `KSeFTask` and pushed to a **Message Queue (RabbitMQ/Kafka)**. The API returns `202 Accepted` with a `jobId`.
+    *   **If denied:** Returns `429 Too Many Requests`.
+3.  **Execution Layer (Consumer):** A dedicated worker service consumes the queue.
+    *   It implements **Exponential Backoff** using a retry exchange (in RabbitMQ) or a dead-letter-queue strategy.
+    *   If the KSeF API returns a `429` or `5xx`, the worker calculates the delay and re-queues the message.
+
+### Pseudocode
+
+**Rate Limiter Service (Producer Side)**
+```java
+public void processRequest(String ip, String nip, Request payload) {
+    String key = "limit:" + ip + ":" + nip;
+    long currentTokens = redisTemplate.opsForValue().get(key);
+
+    if (currentTokens > 0) {
+        redisTemplate.opsForValue().decrement(key);
+        String jobId = UUID.randomUUID().toString();
+        messageQueue.send(new KSeFTask(jobId, payload));
+        return ResponseEntity.accepted().body(new JobResponse(jobId));
+    } else {
+        throw new RateLimitExceededException("KSeF quota exhausted for your NIP.");
+    }
+
+}
+```
+
+**Worker Service (Consumer Side with Backoff)**
+```java
+@Retryable(
+    value = { KSeFExternalException.class }, 
+    maxAttempts = 5, 
+    backoff = @Backoff(delay = 2000, multiplier = 2.0)
+)
+@RabbitListener(queues = "ksef_tasks")
+public void executeKSeFCall(KSeFTask task) {
+    try {
+        ksefClient.submitInvoice(task.getPayload());
+        updateJobStatus(task.getJobId(), "COMPLETED");
+    } catch (HttpStatusCodeException e) {
+        if (e.getStatusCode() == HttpStatus.TOO_MANY_REQUESTS) {
+            // Triggering retry mechanism with exponential backoff
+            throw new KSeFExternalException("KSeF Rate Limit hit, retrying...");
+        }
+        throw e;
+    }
+}
+```
+
+### Tradeoffs
+
+| Feature | Pro | Con |
+| :--- | :--- | :--- |
+| **Asynchronous Queue** | High resilience; protects our system from KSeF downtime; handles spikes via buffering. | Increased complexity; introduces **eventual consistency** (user doesn't get immediate result). |
+| **Redis Token Bucket** | Extremely fast; provides global state across multiple microservice instances. | Requires managing additional infrastructure; risk of "split-brain" if Redis cluster fails. |
+| **Exponential Backoff** | Reduces pressure on KSeF during their outages; prevents "retry storms." | Increases the "time-to-completion" for tasks during high-load periods. |
+
+**Summary:** This design prioritizes **reliability and compliance** over real-time latency, which is the correct trade-off for tax-related integrations where data integrity and respecting government API limits are paramount.

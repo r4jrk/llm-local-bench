@@ -1,0 +1,80 @@
+ In this response, I'll outline a design for a rate-limiting system that meets the specified requirements for a Spring Boot SaaS application integrating with KSeF API.
+
+1. Rate Limiting:
+   For handling IP and NIP (Nested IP) rate limits, we can use a combination of Guava's `RateLimiter` and Redis to store and manage the rate limit tokens. The system will track requests based on both the client's IP address and the nested IP (if available).
+
+```java
+public class RateLimiterService {
+  private final String REDIS_KEY_PREFIX = "rateLimit:";
+  private final RedisRateLimiter redisRateLimiter;
+
+  public RateLimiterService(RedisConnectionFactory connectionFactory) {
+    this.redisRateLimiter = new RedisRateLimiter(connectionFactory, REDIS_KEY_PREFIX);
+  }
+
+  public boolean tryAcquire() {
+    return redisRateLimiter.tryAcquire();
+  }
+}
+```
+
+2. Retry/Backoff Strategy:
+   To implement a retry/backoff strategy, we can use the Backoff utility class from the Spring Framework's `Spring-retry` module. When the rate limiter returns false, we can attempt to acquire tokens again with an exponentially increasing backoff period.
+
+```java
+@Component
+public class RateLimiterRetryAdvice extends RetryableOperationExceptionAdvizer {
+  private final RateLimiterService rateLimiterService;
+
+  public RateLimiterRetryAdvice(RateLimiterService rateLimiterService) {
+    this.rateLimiterService = rateLimiterService;
+  }
+
+  @Override
+  protected Backoff createInitialBackoff(Throwable throwable) {
+    return new ExponentialBackOff(0, 1.5, Math.max(500L, throwable.getClass().getSimpleName().length() * 5));
+  }
+
+  @Override
+  public <T> T executeOperation(RetryCallback<T> operation) {
+    while (true) {
+      try {
+        return operation.doWithRetry(rateLimiterService.tryAcquire());
+      } catch (Exception e) {
+        // Continue with the next retry attempt
+      }
+    }
+  }
+}
+```
+
+3. Queue Architecture:
+   To manage requests when the rate limit is exceeded, we can implement a message-based queue solution like Apache Kafka or RabbitMQ to temporarily store incoming requests and process them later.
+
+4. Pseudocode:
+
+```java
+@Service
+public class ApiGateway {
+  @Autowired
+  private RateLimiterService rateLimiterService;
+  @Autowired
+  private RequestQueue requestQueue;
+
+  public Response callKSeFApi(Request request) {
+    if (rateLimiterService.tryAcquire()) {
+      // Call KSeF API directly
+      return kSeFApiCall(request);
+    } else {
+      // Add the request to the queue for later processing
+      requestQueue.enqueue(request);
+      return new RequestQueuedResponse();
+    }
+  }
+}
+```
+
+5. Tradeoffs:
+   - While Redis is a powerful choice for rate limiting, it may not be suitable for applications with extremely high traffic due to its memory constraints. In such cases, other distributed databases like Cassandra or BigTable could be considered.
+   - Implementing a queue architecture adds complexity to the system and requires additional resources, but provides scalability when handling high request volumes. It may introduce latency in processing requests, which can impact user experience.
+   - The retry/backoff strategy may lead to increased resource usage (CPU and network) as the system attempts more requests when rate-limited. However, this approach reduces the likelihood of throttling legitimate users and improves overall system resilience.

@@ -1,0 +1,79 @@
+**Rate Limiting System for Spring Boot SaaS (KSeF API Integration)**  
+
+To reliably integrate with the KSeF (Polish e-Invoicing) API—known for strict rate limits (e.g., 100 req/min per IP+NIP)—we implement a hybrid token-bucket + sliding-window rate limiter with per-tenant throttling and smart backoff.
+
+### Core Architecture  
+1. **Rate Limiter Layer** (Spring `HandlerInterceptor` or `@RateLimiter` AOP):  
+   - Extracts both client IP and tenant-specific NIP (VAT ID) from headers/context.  
+   - Computes *combined key*: `IP_NIP = SHA256(IP + NIP)`.  
+   - Checks against a distributed Redis store (keys: `ratelimit:ipnip:{hash}`).  
+
+2. **Redis Backend**:  
+   - Uses Redis `INCR` + `EXPIRE` for sliding-window counters (more accurate than fixed windows for bursty traffic).  
+   - Stores: `{requests: int, reset_time: epoch_ms}`.  
+   - Per-tenant limits:  
+     ```redis
+     INCR ratelimit:ipnip:{hash}
+     EXPIRE ratelimit:ipnip:{hash} 60  # 60s window
+     ```
+
+3. **Retry & Backoff Strategy**:  
+   - On `429 Too Many Requests`:  
+     - Client retries with exponential backoff: `T = base * 2^attempt` (e.g., `base=1s`, max `T=30s`).  
+     - Retry header (`Retry-After`) embedded in response (JVM-level backoff via `@Retryable`).  
+   - *Circuit breaker* (Resilience4j): After 5 failures, open circuit for 60s.  
+
+4. **Queue Architecture**:  
+   - **Async Request Queue**: Use Kafka (or RabbitMQ) for decoupling.  
+     - Producer: Spring REST template wrapped in a `@Async` service method.  
+     - Consumer: Pulls from topic, enforces *global* and *tenant-specific* quotas before dispatching.  
+     - *Priority queue*: Critical requests (e.g., `InvoiceStatus`) jump front of queue via dedicated topic partition.  
+   - *Memory queue fallback*: For low-throughput tenants, use bounded `BlockingQueue` (max 100) + `Semaphore` for fairness.  
+
+### Pseudocode  
+```java
+@Aspect
+public class RateLimitAspect {
+    @Around("@annotation(RateLimited)")
+    public Object rateLimit(ProceedingJoinPoint joinPoint) throws Throwable {
+        String ip = getClientIP();
+        String nip = getTenantNIP();
+        String key = SHA256(ip + nip);
+        long windowSize = 60; // seconds
+
+        // Redis sliding window
+        long now = System.currentTimeMillis();
+        long windowStart = now - (windowSize * 1000);
+        Long current = redisTemplate.opsForValue().increment("ratelimit:ipnip:" + key);
+        redisTemplate.expireAt("ratelimit:ipnip:" + key, windowStart + windowSize * 1000);
+
+        if (current > MAX_REQUESTS_PER_WINDOW) {
+            long retryAfter = (windowStart + windowSize * 1000 - now) / 1000 + 1;
+            throw new RateLimitExceededException(retryAfter);
+        }
+
+        try {
+            return joinPoint.proceed();
+        } catch (RateLimitExceededException e) {
+            return handleWithBackoff(joinPoint, e);
+        }
+    }
+
+    @Retryable(maxAttempts = 3, backoff = @Backoff(delay = 1000, multiplier = 2))
+    public ResponseEntity<ApiResponse> submitToKSeF(Request request) { ... }
+}
+```
+
+### Tradeoffs  
+| **Approach** | **Pros** | **Cons** |  
+|--------------|----------|----------|  
+| **Sliding Window (Redis)** | Accurate, handles burst | Redis dependency; TTL sync issues at scale |  
+| **Per-IP+NIP Keying** | Precise per-tenant limit enforcement | Key explosion (10k tenants = 10k keys/min) |  
+| **Kafka Queue** | Async decoupling, high throughput | Latency ↑; opex for Kafka |  
+| **Exponential Backoff** | Prevents thrashing, fair | Slow recovery; poor UX if frequent |  
+| **Priority Queues** | Critical requests deprioritized less | Complexity; risk of starvation |  
+
+**Recommendations**:  
+- Use Redis Cluster for scalability.  
+- Combine with client-side caching (e.g., `Retry-After` duration) to avoid redundant Redis calls.  
+- For multitenancy, consider *per-customer* Redis keyspacing (e.g., `ratelimit:{tenantId}:ipnip:...`) to isolate limits.

@@ -1,0 +1,43 @@
+**Rate Limiting Strategy**
+KSeF enforces strict per-IP and per-NIP quotas. We implement a distributed token bucket using Redisson (`RRateLimiter`). Two limiters track consumption: `IP_{infraNode}` (shared infrastructure quota) and `NIP_{tenantId}` (client-specific quota). The effective allowance is `min(IP_tokens, NIP_tokens)`. Redis guarantees atomic decrements across multiple Spring Boot instances. A local Guava `RateLimiter` acts as a fallback during Redis partitions, capped conservatively to prevent accidental throttling.
+
+**Queue Architecture**
+Incoming invoice requests enter a partitioned Kafka topic (`ksef-ingest`), partitioned by NIP. This guarantees per-tenant ordering and isolates rate limit counters. A pool of `@KafkaListener` workers consumes messages, acquires rate limit tokens, and forwards valid requests to KSeF. If tokens are exhausted, the consumer publishes the event to a delay topic (`ksef-wait`) using Kafka’s delayed message plugin. Successful/final failures route to `ksef-result` or a Dead-Letter Queue (DLQ) for audit.
+
+**Retry & Backoff**
+We wrap KSeF calls with Resilience4j’s `Retry` and `CircuitBreaker`. On 429/5xx, we apply exponential backoff with full jitter: `delay = min(initial * 2^attempt, cap) * random(0.5, 1.5)`. Max retries: 3. The circuit opens after 50% failure rate over 30s, halting traffic for 60s to protect KSeF and prevent queue storms. All metrics (limiter drops, retry counts, DLQ volume) ship to Prometheus/Grafana.
+
+**Pseudocode**
+```java
+@Service
+public class KSeFProcessor {
+    private final RRateLimiter ipLimiter, nipLimiter;
+    private final KSeFClient client;
+    private final KafkaTemplate<String, InvoiceMsg> kafkaTemplate;
+
+    @KafkaListener(topics = "ksef-ingest")
+    public void process(InvoiceMsg msg) {
+        if (ipLimiter.tryAcquire() && nipLimiter.tryAcquire()) {
+            try {
+                var resp = client.postWithResilience(msg);
+                kafkaTemplate.send("ksef-result", resp);
+            } catch (RateLimitExceeded e) {
+                var jitterDelay = calcBackoff(msg.retryCount);
+                kafkaTemplate.send("ksef-wait", msg, jitterDelay);
+            } catch (Exception e) {
+                kafkaTemplate.send("ksef-dlq", msg, e.getMessage());
+            }
+        } else {
+            kafkaTemplate.send("ksef-wait", msg, 2000);
+        }
+    }
+}
+```
+
+**Tradeoffs**
+- *Distributed vs. Local Limits:* Redis enables precise multi-instance enforcement but introduces network latency and a single failure domain. Local fallbacks improve resilience but risk limit violations during split-brain. We accept this risk with conservative local caps.
+- *NIP Partitioning vs. Throughput:* Strict NIP partitioning guarantees compliance and ordering but caps consumer parallelism to unique NIPs. For high-volume tenants, we may introduce sub-partitions, trading strict ordering for throughput.
+- *Delay Topic vs. Requeue:* Dedicated delay topics avoid consumer thrashing and provide predictable backpressure, but increase topic sprawl. RabbitMQ’s dead-letter exchanges simplify this but sacrifice Kafka’s replayability and scalability.
+- *Circuit Breaker Aggressiveness:* Tight thresholds prevent cascade failures but may drop recoverable requests. We tune based on KSeF SLOs and monitor fallback latency.
+
+This architecture prioritizes KSeF compliance, tenant isolation, and operational observability while keeping Spring Boot idioms intact.

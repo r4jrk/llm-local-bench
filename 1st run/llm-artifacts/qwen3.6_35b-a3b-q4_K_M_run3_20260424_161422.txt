@@ -1,0 +1,45 @@
+### Architecture Overview
+Integrating KSeF requires strict adherence to rate limits (e.g., 10 requests/minute per NIP). A SaaS architecture must isolate tenants and handle transient failures gracefully. We propose a hybrid approach: **Redis-based pre-checks** for immediate rejection and an **asynchronous queue** for throughput optimization. NIP here refers to the *Numer Identyfikacji Podatkowej* (Tax ID), the primary rate-limiting entity per KSeF policies.
+
+### Rate Limiting Strategy
+We enforce limits using a **Sliding Window Log** algorithm in Redis for precision. Primary limits apply per **NIP**; secondary limits apply per **IP** to mitigate shared-hosting abuse.
+
+**Pseudocode:**
+```java
+public void checkRateLimit(String nip, String ip) {
+    long now = System.currentTimeMillis();
+    String nipKey = "ksef:sliding:nip:" + nip;
+    String ipKey  = "ksef:sliding:ip:" + ip;
+
+    long nipCount = redisOps.zCard(nipKey);
+    if (nipCount >= 10) throw new RateLimitException("NIP limit exceeded");
+
+    long ipCount = redisOps.zCard(ipKey);
+    if (ipCount >= 50) throw new RateLimitException("IP limit exceeded");
+
+    // Record timestamp
+    redisOps.zAdd(nipKey, now, now + ":" + nip);
+    redisOps.zAdd(ipKey, now, now + ":" + ip);
+    redisOps.expire(nipKey, 60);
+    redisOps.expire(ipKey, 60);
+}
+```
+
+### Retry & Backoff Strategy
+Upon receiving HTTP 429 from KSeF, implement **Exponential Backoff with Jitter**. Jitter prevents the "thundering herd" effect where multiple tenants retry simultaneously.
+- **Formula:** `delay = min(maxDelay, baseDelay * 2^attempt) + random(0, jitter)`.
+- **Max Retries:** 3. Exceeding this routes the payload to a Dead Letter Queue (DLQ) for batch retry or manual intervention.
+
+### Queue Architecture
+Synchronous calls to KSeF are brittle. We decouple submission from processing:
+1.  **Producer:** Validates request and performs the optimistic Redis check. Pushes to **RabbitMQ**.
+2.  **Queue:** Use **NIP-partitioned queues** or a **round-robin worker pool** to ensure fair distribution. Messages include idempotency keys (e.g., generated UWN) to prevent duplicates.
+3.  **Consumers:** Workers consume messages and enforce a local **Token Bucket** to respect limits without hitting Redis on every consume.
+4.  **DLQ:** Failed payloads move here for monitoring.
+
+### Tradeoffs
+- **Latency vs. Reliability:** Queues introduce latency; the API must return `202 Accepted` immediately.
+- **Redis Load:** Sliding Window Logs consume memory proportional to requests. Under high load, switch to **Sliding Window Counter** (approximate but efficient).
+- **NIP vs. IP:** Limiting by NIP protects business logic; IP limits protect infrastructure. However, dynamic IPs (e.g., mobile users) risk false positives on IP limits.
+- **Complexity:** Async processing requires strict idempotency. KSeF requires unique workflow numbers; our system must guarantee UWN generation before retry.
+- **Cost:** RabbitMQ and Redis increase operational overhead but are essential for SaaS stability.

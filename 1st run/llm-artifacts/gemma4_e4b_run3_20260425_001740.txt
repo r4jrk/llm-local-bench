@@ -1,0 +1,57 @@
+As a senior backend engineer, I recommend designing a rate limiting system that is asynchronous, stateful, and highly resilient, using a combination of Redis and a message queue.
+
+### System Design Overview
+
+The architecture will consist of three layers: the **Gateway/API Layer**, the **Rate Limiting Service**, and the **Worker Pool**.
+
+**1. State Management (Redis):**
+Redis will store the rate limit counters, keyed by a composite identifier (e.g., `rate:ip:<IP>:<NIP>`). This allows atomic incrementing and expiration setting (using `INCR` and `EXPIRE`) for both IP-based and NIP-based limits.
+
+**2. Queue Architecture (Kafka/RabbitMQ):**
+Instead of blocking the incoming API request, the Spring Boot controller will immediately place the request payload (containing NIP, IP, and the API method call) into a durable queue (e.g., Kafka). This decouples the ingress rate from the egress rate, handling bursts gracefully.
+
+**3. Worker Pool:**
+Dedicated worker services (Spring `@Service` components listening to the queue) will consume messages. These workers are responsible for checking the limits, executing the call, and managing the backoff logic.
+
+### Pseudocode: The Worker Logic
+
+```pseudocode
+FUNCTION process_request(message):
+    NIP = message.nip
+    IP = message.ip
+    API_CALL = message.call_data
+
+    TRY:
+        // 1. Check Rate Limits
+        IF rate_limit_exceeded(IP, NIP):
+            delay_time = calculate_backoff(message.attempt_count)
+            requeue_message(message, delay_time) // Exponential backoff
+            RETURN FAILURE
+
+        // 2. Execute API Call
+        response = KsefClient.execute(API_CALL)
+        RETURN SUCCESS, response
+
+    CATCH (RateLimitExceededException):
+        delay_time = calculate_backoff(message.attempt_count)
+        requeue_message(message, delay_time)
+        RETURN FAILURE
+
+    CATCH (TransientFailureException):
+        delay_time = calculate_backoff(message.attempt_count)
+        requeue_message(message, delay_time)
+        RETURN FAILURE
+```
+
+### Retry and Backoff Strategy
+
+We will implement **Exponential Backoff with Jitter**. Upon failure (due to rate limiting or transient errors), the message is not discarded but rather requeued to the Kafka topic with an increasing delay multiplier (e.g., $2^n$ seconds, plus jitter to prevent synchronized retries). A maximum retry attempt count must be enforced before moving the message to a Dead Letter Queue (DLQ) for manual inspection.
+
+### Tradeoffs Discussion
+
+| Feature | Tradeoff Consideration | Mitigation |
+| :--- | :--- | :--- |
+| **Asynchronicity (Queue)** | Increased perceived latency for the end-user (they don't get an immediate response). | Implement a polling mechanism or a webhook/callback flow to notify the client when the asynchronous task completes. |
+| **Complexity (Redis/Kafka)** | Significant increase in operational complexity and infrastructure overhead. | Use managed services (AWS ElastiCache, Managed Kafka) to offload maintenance burden. |
+| **Accuracy (Redis Window)** | If using a fixed window counter (Time $T$), bursts right at the window edge (e.g., $T_{start}-1$ and $T_{start}$) can still violate rate limits. | Implement the **Sliding Window Log** approach in Redis for mathematically precise rate limiting. |
+| **State Management** | Requires distributed coordination to ensure multiple workers don't simultaneously violate the limit. | All limit checks *must* be performed using atomic Redis operations (Lua scripting) to maintain strong consistency. |

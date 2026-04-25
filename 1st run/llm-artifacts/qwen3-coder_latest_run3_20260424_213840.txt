@@ -1,0 +1,98 @@
+## Rate Limiting System for Spring Boot SaaS with KSeF Integration
+
+### Architecture Overview
+
+I'll design a distributed rate limiting system using Redis with a token bucket algorithm for both IP and NIP (tax number) limits.
+
+```java
+@Component
+public class RateLimitingService {
+    private final RedisTemplate<String, String> redisTemplate;
+    
+    public boolean isAllowed(String ip, String nip, int limit, Duration window) {
+        String ipKey = "rate_limit:ip:" + ip;
+        String nipKey = "rate_limit:nip:" + nip;
+        
+        return checkAndApplyLimit(ipKey, limit, window) && 
+               checkAndApplyLimit(nipKey, limit, window);
+    }
+    
+    private boolean checkAndApplyLimit(String key, int limit, Duration window) {
+        String script = "local current = redis.call('GET', KEYS[1]) " +
+                       "if current and tonumber(current) >= tonumber(ARGV[1]) then " +
+                       "return 0 " +
+                       "else " +
+                       "redis.call('INCR', KEYS[1]) " +
+                       "redis.call('EXPIRE', KEYS[1], ARGV[2]) " +
+                       "return 1 " +
+                       "end";
+        
+        return redisTemplate.execute(
+            new DefaultRedisScript<>(script, Boolean.class),
+            Collections.singletonList(key),
+            String.valueOf(limit),
+            String.valueOf(window.getSeconds())
+        );
+    }
+}
+```
+
+### Queue Architecture
+
+Implement a priority queue system with two levels:
+1. **Primary Queue**: High-priority requests (e.g., authenticated users)
+2. **Secondary Queue**: Low-priority requests (e.g., anonymous users)
+
+```java
+@Service
+public class RequestQueueService {
+    private final BlockingQueue<RequestContext> primaryQueue = 
+        new PriorityBlockingQueue<>(1000, Comparator.comparingInt(RequestContext::getPriority));
+    
+    private final BlockingQueue<RequestContext> secondaryQueue = 
+        new LinkedBlockingQueue<>(5000);
+    
+    public void submitRequest(RequestContext context) {
+        if (context.isHighPriority()) {
+            primaryQueue.offer(context);
+        } else {
+            secondaryQueue.offer(context);
+        }
+    }
+}
+```
+
+### Retry/Backoff Strategy
+
+Implement exponential backoff with jitter:
+```java
+@Retryable(
+    value = {RateLimitExceededException.class},
+    maxAttempts = 3,
+    backoff = @Backoff(delay = 1000, multiplier = 2, jitter = true)
+)
+public ResponseEntity<?> makeKSeFRequest(RequestContext context) {
+    // API call logic
+}
+```
+
+### Tradeoffs
+
+**Pros:**
+- Redis provides distributed consistency and low latency
+- Token bucket algorithm handles burst traffic gracefully
+- Queue system prevents system overload during peak times
+- Configurable limits per IP/NIP combination
+
+**Cons:**
+- Single point of failure in Redis (mitigated with clustering)
+- Memory overhead for storing rate limit state
+- Additional complexity in queue management
+- Potential latency increase during high load
+
+**Alternative approaches:** 
+- In-memory limits for simple deployments
+- Circuit breaker pattern for service resilience
+- Database-based limits for persistence across restarts
+
+This design balances performance, scalability, and reliability for SaaS applications requiring strict rate limiting with KSeF API integration.

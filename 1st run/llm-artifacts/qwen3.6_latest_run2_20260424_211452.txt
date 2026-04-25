@@ -1,0 +1,28 @@
+For a Spring Boot SaaS interfacing with KSeF, we need a distributed rate-limiting layer that respects per-tenant IP and NIP constraints while decoupling request generation from KSeF’s strict API quotas.
+
+**Distributed Rate Limiting (IP+NIP)**
+Use a sliding window counter in Redis. The composite key is `{tenantId}:{ip}:{nip}`. Implement via atomic Lua scripts to eliminate race conditions under concurrent SaaS traffic. Integrate via `Resilience4j` with a Redis rate limiter backend. Each service instance checks the limit synchronously; if exhausted, the request is routed to a processing queue rather than failing immediately, ensuring quota fairness across tenants and preventing false positives from legitimate NAT-shared clients.
+
+**Queue Architecture**
+Decouple submission from execution using Kafka. Tenants publish `KsefSubmissionEvent` to a topic partitioned by `{tenantId}`. A horizontally scalable Spring Kafka consumer group reads messages, applies the Redis rate limiter, and dispatches via `WebClient` to KSeF. Add a configurable dead-letter queue (DLQ) for expired payloads or persistent KSeF 5xx errors. Enforce schema validation at the producer to reject malformed submissions before they consume quotas or trigger retries.
+
+**Retry & Backoff Strategy**
+Wrap KSeF HTTP calls in `Resilience4j Retry`. Configure it to trigger on HTTP 429, 5xx, or transient network failures. Use exponential backoff with jitter: `initialDelay=1s`, `maxDelay=30s`, `multiplier=2`. Crucially, parse and honor KSeF’s `Retry-After` header when present. Combine with a local circuit breaker and bulkhead to prevent cascade failures during KSeF outages or sudden quota resets.
+
+**Pseudocode**
+```java
+public Mono<KsefResponse> submit(KsefRequest req) {
+    String key = req.tenantId() + ":" + req.ip() + ":" + req.nip();
+    if (!rateLimiter.tryAcquire(key, 1)) {
+        return kafkaProducer.send(req).map(f -> req); // enqueue
+    }
+    return callKsef(req)
+        .retryWhen(Retry.backoff(5, Duration.ofMillis(1000))
+            .maxBackoff(Duration.ofSeconds(30))
+            .jitter(0.5)
+            .filter(KsefRateLimitException.class));
+}
+```
+
+**Tradeoffs & Considerations**
+Sliding window Redis offers precise O(1) accuracy but adds ~1–2ms latency per request. Kafka provides strong durability, replayability, and horizontal scaling but increases operational overhead; RabbitMQ is lighter but struggles with high-throughput SaaS bursts. Strict IP+NIP limiting may incorrectly throttle legitimate clients sharing NAT gateways; mitigate by falling back to tenant-level limits or dynamic quota pools during high congestion. Retry jitter eliminates thundering herd risks but increases tail latency. Target 85% quota utilization to absorb traffic spikes. Finally, monitor Redis memory and Kafka lag continuously; auto-scaling consumers based on partition lag prevents request drift during KSeF rate limit fluctuations.

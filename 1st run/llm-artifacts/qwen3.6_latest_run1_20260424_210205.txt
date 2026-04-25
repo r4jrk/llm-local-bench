@@ -1,0 +1,26 @@
+A distributed rate limiter paired with a decoupled message queue ensures reliable KSeF API integration. Spring Boot producers publish requests to a bounded queue, while workers consume them through a sliding-window rate limiter that tracks both client IP and NIP identifiers. This dual-key approach prevents a single high-volume IP from exhausting the shared NIP quota and ensures fair distribution across network boundaries.
+
+We implement the counter in Redis using a Lua script to atomically increment and validate thresholds across distributed workers. The script returns current window counts alongside configured quotas. If either limit is breached, the limiter rejects the attempt, signaling the orchestrator to defer processing. To minimize latency, we cache quota metadata in local Caffeine maps and only fetch Redis on cache misses.
+
+The queue architecture uses RabbitMQ with a FIFO exchange and a memory-bounded queue (`x-max-length`). This applies graceful backpressure, preventing out-of-memory crashes during traffic spikes. Each message carries IP, NIP, payload, and an attempt counter. A dedicated DLQ captures exhausted retries. Workers consume concurrently, enforce the rate limit, and forward successful calls to KSeF, routing responses via a correlation ID for synchronous callers. We implement queue-level prefetching tuned to worker capacity, ensuring smooth throughput under variable KSeF response times.
+
+Retry logic employs Spring Retry with exponential backoff and jitter. Delay = `baseMs * (1.5 ^ attempt) + random(0, 300)`. Retries respect KSeF’s `Retry-After` header when available. After max attempts, the message dead-letters. Non-retriable errors bypass the queue and return immediately.
+
+```lua
+-- Redis Lua rate limiter
+local ip = KEYS[1], nip = KEYS[2], limI = ARGV[1], limN = ARGV[2], win = 60
+local iCnt = redis.call('INCR', ip); if iCnt==1 then redis.call('EXPIRE', ip, win) end
+local nCnt = redis.call('INCR', nip); if nCnt==1 then redis.call('EXPIRE', nip, win) end
+return {iCnt, nCnt}
+```
+```java
+// Java Worker Snippet
+long[] c = limiter.tryAcquire(msg.ip, msg.nip);
+if (c[0] > limI || c[1] > limN) queue.defer(msg, attempt);
+else {
+    var resp = ksef.call(msg.body);
+    resp.status == 429 ? queue.retryWithHeader(resp, msg) : queue.resolve(msg, resp);
+}
+```
+
+Tradeoffs: Redis Lua guarantees consistency but adds network latency and requires cluster-aware key management to avoid hotspots. A bounded queue protects application memory but sacrifices guaranteed delivery under sustained overload. Exponential backoff shields KSeF but increases end-user latency; jitter mitigates thundering herds. Dual IP/NIP limits improve fairness but complicate monitoring and key expiration. For production, sharding Redis keys by NIP prefix or offloading initial throttling to an edge gateway (e.g., Envoy/Kong) reduces backend load while simplifying core service complexity. Monitoring quota saturation via Prometheus histograms enables dynamic quota scaling. However, Redis dependency introduces a critical path; failover strategies like local token-bucket fallback prevent total service degradation. Ultimately, the architecture prioritizes external API stability over absolute request delivery, accepting bounded loss as a valid tradeoff for SaaS resilience.

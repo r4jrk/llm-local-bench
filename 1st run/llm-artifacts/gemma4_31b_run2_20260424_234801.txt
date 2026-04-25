@@ -1,0 +1,67 @@
+As a senior backend engineer, I propose a **Distributed Asynchronous Throttling Architecture**. Since KSeF imposes limits on both the source IP and the combination of IP+NIP, a synchronous approach would lead to thread exhaustion and high failure rates.
+
+### 1. High-Level Architecture
+We will decouple the request submission from the API execution using a message queue (RabbitMQ or Kafka) and a distributed state store (Redis).
+
+**The Flow:**
+1. **Ingestion:** API requests are validated and pushed into a `ksef-pending-queue`.
+2. **Throttling Worker:** A consumer pulls messages and checks two Redis keys before execution:
+   - `ratelimit:ip:{ip}` (Global IP limit)
+   - `ratelimit:ip:nip:{ip}:{nip}` (Per-taxpayer limit)
+3. **Execution:** If permits exist, the call is made. If not, the message is requeued with a delay.
+
+### 2. Retry & Backoff Strategy
+To handle `429 Too Many Requests` and internal limits, we implement **Exponential Backoff with Jitter**.
+- **Immediate Retry:** For transient network errors.
+- **Delayed Retry:** For 429s, move the message to a "Delay Exchange" (TTL queue) that puts the message back into the main queue after $2^n$ seconds.
+
+### 3. Queue Architecture
+- **Main Queue:** High-throughput buffer for all outgoing KSeF requests.
+- **Retry Queues:** A series of TTL-based queues (e.g., 5s, 30s, 5m) to prevent "retry storms."
+- **DLQ (Dead Letter Queue):** For requests that fail after $X$ attempts or return 400 (Bad Request).
+
+### 4. Pseudocode Implementation
+
+```java
+@Service
+public class KSeFDispatcher {
+    @Autowired private RedisTemplate<String, String> redis;
+    @Autowired private RabbitTemplate rabbit;
+
+    public void processInvoice(InvoiceTask task) {
+        String ipKey = "limit:ip:" + outboundIp;
+        String nipKey = "limit:ip:nip:" + outboundIp + ":" + task.getNip();
+
+        if (isAllowed(ipKey) && isAllowed(nipKey)) {
+            try {
+                ksefClient.send(task);
+                decrementPermits(ipKey, nipKey);
+            } catch (RateLimitException e) {
+                handleRetry(task, 1);
+            }
+        } else {
+            handleRetry(task, 1); // Requeue due to local rate limit
+        }
+    }
+
+    private boolean isAllowed(String key) {
+        return Boolean.TRUE.equals(redis.opsForValue().get(key)); 
+        // Or use Lua script for atomic decrement/check
+    }
+
+    private void handleRetry(InvoiceTask task, int attempt) {
+        long delay = calculateExponentialBackoff(attempt);
+        rabbit.convertAndSend("ksef.retry.exchange", "retry.key", task, 
+            m -> m.getMessageProperties().setDelay((int)delay));
+    }
+}
+```
+
+### 5. Tradeoffs & Considerations
+
+| Tradeoff | Decision | Justification |
+| :--- | :--- | :--- |
+| **Latency vs. Reliability** | Reliability | KSeF is an asynchronous system by nature; eventual consistency is acceptable over immediate response. |
+| **Redis vs. Local Cache** | Redis | Necessary for a SaaS. Local caches fail in horizontal scaling (multiple pods hitting the same IP). |
+| **Token Bucket vs. Fixed Window** | Token Bucket | Allows for short bursts of traffic while maintaining a steady average rate, mirroring KSeF's likely behavior. |
+| **Complexity vs. Precision** | Medium | Using a Delay Exchange adds infra complexity but prevents the "thundering herd" problem during recovery. |

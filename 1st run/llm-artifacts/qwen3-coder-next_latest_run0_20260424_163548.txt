@@ -1,0 +1,69 @@
+**Rate Limiting System for Spring Boot SaaS (KSeF API Integration)**
+
+**Architecture Overview**  
+We implement a hybrid rate-limiting strategy using Redis for distributed state, with per-tenant and per-client IP/NIP tracking. Two key limits:  
+- *Global*: Max requests to KSeF per minute (e.g., 60)  
+- *Per-tenant/IP+NIP*: Stricter quota (e.g., 10/min)  
+
+**Core Components**  
+1. **Rate Limiter Filter** (Spring WebFlux/Servlet filter):  
+   - Extracts `X-Client-IP` and `X-NIP` (customer VAT ID) from headers  
+   - Uses `RedisRateLimiter` with sliding-window token bucket (Redis `SCRIPT LOAD` + `EVALSHA` for atomicity)  
+   - Key format: `ratelimit:{ksef}:{window_ms}:{tenantId|ip+nip}`  
+
+2. **Retry/Backoff Strategy**  
+   - On `429 Too Many Requests`:  
+     - Apply exponential backoff: `delay = base * 2^retry × (1 + jitter)`  
+     - Queue request via `RatelimitRetryQueue` (Redis list + sorted set for TTL)  
+   - Retry worker (scheduled `@Scheduled(fixedDelay = 500ms)`):  
+     - Poll queue; if within rate limit (check via Redis `INCRBY` + `EXPIRE`), dispatch  
+     - On success: delete queued item; on repeated failures: escalate (log/alert/drop)  
+
+3. **Queue Architecture**  
+   - **Priority Queue per tenant**: Redis `ZSET` with `score = timestamp + priority_offset`  
+   - *Priority tiers*:  
+     - T0: High (sync critical queries)  
+     - T1: Standard  
+     - T2: Bulk reports  
+   - TTL: 60s (drop stale requests)  
+   - Consumer: `QueueProcessor` thread pool (max concurrency = KSeF’s burst limit)  
+
+**Pseudocode**  
+```java
+@Aspect
+public class KsefRateLimiter {
+    @Autowired RedisTemplate<String, String> redis;
+    
+    @Around("@annotation(KsefRequest)")
+    public Object limit(ProceedingJoinPoint pjp) throws Throwable {
+        String key = buildKey(tenantId, ip, nip);
+        String script = """
+        local current = redis.call('INCRBY', KEYS[1], 1)
+        if current == 1 then redis.call('EXPIRE', KEYS[1], tonumber(ARGV[2])) end
+        if current > tonumber(ARGV[1]) then return 0 end
+        return 1
+        """;
+        
+        Boolean allowed = redis.execute(script, List.of(key), 10, 60); // 10 req/60s
+        
+        if (!allowed) {
+            queueRetry(pjp.getArguments(), backoffDelay(retryCount));
+            throw new RateLimitExceededException();
+        }
+        return pjp.proceed();
+    }
+}
+```
+
+**Tradeoffs**  
+- **Accuracy vs. Latency**: Sliding-window (Redis `ZSET`) is precise but CPU-intensive; fixed window (simple `INCR`) is faster but may allow 2× burst at boundaries.  
+- **Consistency vs. Scalability**: Redis is consistent (prevents overuse), but local in-memory counters (e.g., Caffeine) scale better—use hybrid: Redis for global, local for per-node enforcement.  
+- **Queue vs. Immediate Fail**: Queuing improves UX but risks memory exhaustion and latency drift. Bound queue size + DLQ for failure handling mitigates this.  
+- **Tenant Isolation**: Per-tenant keys ensure fairness but increase Redis memory footprint. Consider tiered quotas (e.g., free vs. enterprise) to optimize.  
+
+**Production Notes**  
+- Monitor `429` rates via Prometheus (`ksef_ratelimit_rejections_total`).  
+- Use circuit breaker (Resilience4j) *after* rate limiting to prevent cascading failures.  
+- Sync tenant config (limits, backoff params) via Spring Cloud Config.  
+
+This design balances correctness, resilience, and scalability for high-stakes KSeF integration.
