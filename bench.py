@@ -15,18 +15,18 @@ from system_monitor import SystemMonitor
 OLLAMA_URL = "http://localhost:11434/api/generate"
 
 MODELS = [
-    # "qwen3.6:35b-a3b-q4_K_M",
-    # "fredrezones55/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive:latest",
-    # "qwen3-coder-next:latest",
-    # "qwen3.6:27b-q4_K_M",
-    # "qwen3.6:latest",
-    # "qwen3-coder:latest",
-    # "hf.co/speakleash/Bielik-11B-v3.0-Instruct-GGUF:Q4_K_M",
+    "qwen3.6:35b-a3b-q4_K_M",
+    "fredrezones55/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive:latest",
+    "qwen3-coder-next:latest",
+    "qwen3.6:27b-q4_K_M",
+    "qwen3.6:latest",
+    "qwen3-coder:latest",
+    "hf.co/speakleash/Bielik-11B-v3.0-Instruct-GGUF:Q4_K_M",
     "mistral:latest",
-    # "deepseek-coder",
-    # "gemma4:31b",
-    # "gemma4:26b",
-    # "gemma4:e4b",
+    "deepseek-coder",
+    "gemma4:31b",
+    "gemma4:26b",
+    "gemma4:e4b",
 ]
 
 PROMPT = """You are a senior backend engineer.
