@@ -1,26 +1,28 @@
+import argparse
 import time
+import re
 import json
-import csv
+from queue import Queue
 import threading
+import csv
+import os
 import requests
-import psutil
-import subprocess
-from datetime import datetime
-from typing import List, Dict
 
-import system_monitor
+from worker import run_single
+from aggregator import aggregate, score_quality
+from system_monitor import SystemMonitor
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
 
 MODELS = [
     # "qwen3.6:35b-a3b-q4_K_M",
-    "fredrezones55/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive:latest",
+    # "fredrezones55/Qwen3.6-35B-A3B-Uncensored-HauhauCS-Aggressive:latest",
     # "qwen3-coder-next:latest",
     # "qwen3.6:27b-q4_K_M",
     # "qwen3.6:latest",
     # "qwen3-coder:latest",
-    "hf.co/speakleash/Bielik-11B-v3.0-Instruct-GGUF:Q4_K_M",
-    # "mistral:latest",
+    # "hf.co/speakleash/Bielik-11B-v3.0-Instruct-GGUF:Q4_K_M",
+    "mistral:latest",
     # "deepseek-coder",
     # "gemma4:31b",
     # "gemma4:26b",
@@ -28,182 +30,227 @@ MODELS = [
 ]
 
 PROMPT = """You are a senior backend engineer.
-
 Design a rate limiting system for a Spring Boot SaaS integrating with KSeF API.
-Requirements:
-- handle IP+NIP rate limits
-- include retry/backoff strategy
-- propose queue architecture
-- include pseudocode
-- discuss tradeoffs
+Include pseudocode and tradeoffs."""
 
-Answer in ~400–500 words.
-"""
-
-RUNS_PER_MODEL = 3
-TIMEOUT = 3600
-ARTIFACT_DIR = "llm-artifacts"
+TIMEOUT = 600
+ARTIFACT_DIR = "artifacts"
+WARMUP_RUNS = 1
+COOLDOWN_SECONDS = 3
 
 
-def get_gpu_usage():
-    try:
-        result = subprocess.check_output(
-            ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used", "--format=csv,noheader,nounits"]
-        ).decode().strip()
-        gpu_util, mem = result.split(",")
-        return float(gpu_util), float(mem)
-    except Exception:
-        return 0.0, 0.0
+def check_ollama_available(url, retries=3, delay=1.0):
+    for attempt in range(retries):
+        try:
+            r = requests.get(url.replace("/api/generate", "/api/tags"), timeout=2)
+            if r.status_code == 200:
+                return True
+        except requests.exceptions.RequestException:
+            pass
 
+        print(f"Ollama not reachable (attempt {attempt+1}/{retries})...")
+        time.sleep(delay)
 
-    def summary(self):
-        if not self.samples:
-            return {}
-        
-        def avg(key):
-            return sum(s[key] for s in self.samples) / len(self.samples)
+    return False
 
-        def peak(key):
-            return max(s[key] for s in self.samples)
+def worker_thread(q, results, model):
+    while True:
+        item = q.get()
+        if item is None:
+            break
+        results.append(run_single(model, PROMPT, TIMEOUT))
+        q.task_done()
 
-        return {
-            "cpu_avg": avg("cpu"),
-            "gpu_avg": avg("gpu"),
-            "ram_avg": avg("ram"),
-            "disk_read_avg": avg("disk_read_bps"),
-            "disk_read_peak": peak("disk_read_bps"),
-            "disk_write_avg": avg("disk_write_bps"),
-        }
-
-
-def run_stream(model: str, run_id: int) -> Dict:
-    payload = {
-        "model": model,
-        "prompt": PROMPT,
-        "stream": True
-    }
-
-    monitor = SystemMonitor()
-    monitor.start()
-
-    t_start = time.time()
-    t_first_token = None
-
-    response = requests.post(OLLAMA_URL, json=payload, stream=True, timeout=TIMEOUT)
-
-    full_text = ""
-    last_json = None
-
-    for line in response.iter_lines():
-        if not line:
-            continue
-
-        data = json.loads(line.decode())
-
-        if t_first_token is None:
-            t_first_token = time.time()
-
-        if "response" in data:
-            full_text += data["response"]
-
-        last_json = data
-
-    t_end = time.time()
-    monitor.stop()
-
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{ARTIFACT_DIR}/{model.replace(':','_')}_run{run_id}_{timestamp}.txt"
-
-    with open(filename, "w", encoding="utf-8") as f:
-        f.write(full_text)
-
-    eval_count = last_json.get("eval_count", 0)
-    eval_duration = last_json.get("eval_duration", 0)
-
-    tps = 0
-    if eval_duration > 0:
-        tps = eval_count / (eval_duration / 1e9)
-
-    metrics = monitor.summary()
-
-    return {
-        "model": model,
-        "tokens": eval_count,
-        "tps": tps,
-        "wall_s": t_end - t_start,
-        "ttft": (t_first_token - t_start) if t_first_token else None,
-        **metrics,
-    }
-
-
-def benchmark_model(model: str):
+def run_concurrent(model, requests, concurrency):
+    q = Queue()
     results = []
+    threads = []
+    for _ in range(concurrency):
+        t = threading.Thread(target=worker_thread, args=(q, results, model))
+        t.start()
+        threads.append(t)
 
-    # warmup
-    _ = run_stream(model, run_id=0)
+    for _ in range(requests):
+        q.put(1)
 
-    for i in range(RUNS_PER_MODEL):
-        print(f"   Run {i+1}/{RUNS_PER_MODEL}")
-        res = run_stream(model, run_id=i+1)
-        results.append(res)
+    q.join()
 
-    # average
-    def avg(key):
-        vals = [r[key] for r in results if r[key] is not None]
-        return sum(vals) / len(vals)
+    for _ in threads:
+        q.put(None)
+    for t in threads:
+        t.join()
 
-    return {
-        "model": model,
-        "tps": avg("tps"),
-        "wall_s": avg("wall_s"),
-        "ttft": avg("ttft"),
-        "cpu_avg": avg("cpu_avg"),
-        "gpu_avg": avg("gpu_avg"),
-        "ram_avg": avg("ram_avg"),
-    }
+    return results
 
+def run_sequential(model, requests):
+    results = []
+    for i in range(requests):
+        print(f"   Request {i+1}/{requests}")
+        results.append(run_single(model, PROMPT, TIMEOUT))
+    return results
 
-def main():
-    import os
-    os.makedirs(ARTIFACT_DIR, exist_ok=True)
-
+def run_all(mode, requests, concurrency):
     all_results = []
 
     for model in MODELS:
-        print(f"\n=== {model} ===")
+        print(f"\n----- {model} -----")
+
         try:
-            res = benchmark_model(model)
-            all_results.append(res)
+            for _ in range(WARMUP_RUNS):
+                warm = run_single(model, PROMPT, TIMEOUT)
+                if warm.get("error"):
+                    raise RuntimeError(f"Warmup failed: {warm['error']}")
+
+            time.sleep(COOLDOWN_SECONDS)
+
+            monitor = SystemMonitor()
+            monitor.start()
+
+            if mode == "sequential":
+                results = run_sequential(model, requests)
+            else:
+                results = run_concurrent(model, requests, concurrency)
+
+            monitor.stop()
+            time.sleep(0.2)
+            sys_metrics = monitor.summary()
+
+            if not results:
+                print(f"⚠️ No results for {model}")
+                continue
+
+            valid = [r for r in results if not r.get("error")]
+            failed = len(results) - len(valid)
+
+            if failed > 0:
+                print(f"⚠️ {failed}/{len(results)} failed runs for {model}")
+
+            if not valid:
+                print(f"❌ All runs failed for {model}")
+                continue
+
+            stats = aggregate(valid)
+            stats["model"] = model
+            stats["quality_score"] = score_quality(valid)
+
+            stats["tokens_per_request"] = (
+                sum(r["tokens"] for r in valid) / len(valid)
+            )
+
+            stats["failed_runs"] = failed
+            stats["total_runs"] = len(results)
+
+            stats.update(sys_metrics)
+            all_results.append(stats)
+            save_artifacts(model, results, stats)
+
         except Exception as e:
-            print(f"ERROR: {e}")
+            print(f"❌ ERROR in model {model}: {e}")
 
-    # sort by tps
-    all_results.sort(key=lambda x: x["tps"], reverse=True)
+        finally:
+            try:
+                import requests as rq
+                rq.post(
+                    "http://localhost:11434/api/generate",
+                    json={"model": model, "keep_alive": 0},
+                    timeout=2
+                )
+            except Exception:
+                pass
 
-    # print
-    print("\n=== RESULTS ===")
-    print(f"{'Model':28} | t/s | TTFT | Wall | CPU | GPU | RAM")
-    print("-" * 80)
+            time.sleep(COOLDOWN_SECONDS)
 
-    for r in all_results:
-        print(
-            f"{r['model'][:28]:28} | "
-            f"{r['tps']:5.1f} | "
-            f"{r['ttft']:5.2f}s | "
-            f"{r['wall_s']:5.2f}s | "
-            f"{r['cpu_avg']:4.1f}% | "
-            f"{r['gpu_avg']:4.1f}% | "
-            f"{r['ram_avg']:4.1f}%"
-        )
+    return all_results
 
-    # CSV export
-    with open("benchmark_results.csv", "w", newline="") as f:
+
+def safe_name(name: str) -> str:
+    return re.sub(r'[^a-zA-Z0-9._-]', '_', name)
+
+
+def save_artifacts(model, results, stats):
+    model_dir = os.path.join("artifacts", safe_name(model))
+    os.makedirs(model_dir, exist_ok=True)
+
+    for i, r in enumerate(results, 1):
+        with open(os.path.join(model_dir, f"run_{i}.txt"), "w", encoding="utf-8") as f:
+            f.write(r.get("text", ""))
+
+        with open(os.path.join(model_dir, f"run_{i}.json"), "w") as f:
+            json.dump(r, f, indent=2)
+
+    with open(os.path.join(model_dir, "prompt.txt"), "w") as f:
+        f.write(PROMPT)
+
+    with open(os.path.join(model_dir, "stats.json"), "w") as f:
+        json.dump(stats, f, indent=2)
+
+    with open(os.path.join(model_dir, "summary.txt"), "w") as f:
+        f.write(f"Model: {model}\\n")
+        for k, v in stats.items():
+            f.write(f"{k}: {v}\\n")
+
+
+def save_global_results(all_results):
+    os.makedirs("results", exist_ok=True)
+
+    with open("results/results.json", "w") as f:
+        json.dump(all_results, f, indent=2)
+
+    with open("results/results.csv", "w", newline="") as f:
         writer = csv.DictWriter(f, fieldnames=all_results[0].keys())
         writer.writeheader()
         writer.writerows(all_results)
 
-    print("\nSaved results to benchmark_results.csv and artifacts/ directory")
+    sorted_results = sorted(all_results, key=composite_score, reverse=True)
 
+    with open("results/leaderboard.txt", "w") as f:
+        f.write(f"{'Model':28} | TPS | TTFT | Quality | Tokens\n")
+        f.write("-" * 80 + "\n")
+
+        for r in sorted_results:
+            f.write(
+                f"{r['model'][:28]:28} | "
+                f"{r['steady_tps_avg']:.1f} | "
+                f"{r['ttft_p50']:.2f} | "
+                f"{r['quality_score']:.2f} | "
+                f"{r['tokens_per_request']:.1f}\n"
+            )
+
+
+def composite_score(r):
+    return (
+        r["steady_tps_avg"] * 0.5 +
+        r["quality_score"] * 0.3 -
+        r["ttft_p50"] * 0.2
+    )
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mode", choices=["sequential","concurrent"], default="sequential")
+    parser.add_argument("--requests", type=int, default=5)
+    parser.add_argument("--concurrency", type=int, default=2)
+    args = parser.parse_args()
+
+    if not check_ollama_available(OLLAMA_URL):
+        print("\n❌ Ollama is not running or not reachable at:", OLLAMA_URL)
+        print("👉 Start it with: ollama serve")
+        return
+
+    results = run_all(args.mode, args.requests, args.concurrency)
+    save_global_results(results)
+
+    results.sort(key=lambda x: x["steady_tps_avg"], reverse=True)
+
+    print("\n=== FINAL ===")
+    print(f"{'Model':28} | TPS | TTFT | Quality | Tokens")
+    for r in results:
+        print(f"{r['model'][:28]:28} | {r['steady_tps_avg']:.1f} | {r['ttft_p50']:.2f} | {r['quality_score']:.2f} | {r['tokens_per_request']:.1f}")
+
+    with open("results.csv","w",newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=results[0].keys())
+        writer.writeheader()
+        writer.writerows(results)
 
 if __name__ == "__main__":
     main()
