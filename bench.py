@@ -243,9 +243,20 @@ def main():
     results.sort(key=lambda x: x["steady_tps_avg"], reverse=True)
 
     print("\n=== FINAL ===")
-    print(f"{'Model':28} | TPS | TTFT | Quality | Tokens")
+    print(f"{'Model':28} | TPS | TTFT | CPU | GPU | VRAM | RAM | Tokens")
+    print("-" * 100)
+
     for r in results:
-        print(f"{r['model'][:28]:28} | {r['steady_tps_avg']:.1f} | {r['ttft_p50']:.2f} | {r['quality_score']:.2f} | {r['tokens_per_request']:.1f}")
+        print(
+            f"{r['model'][:28]:28} | "
+            f"{r['steady_tps_avg']:5.1f} | "
+            f"{r['ttft_p50']:5.2f} | "
+            f"{r.get('cpu_avg', 0):4.1f}% | "
+            f"{r.get('gpu_avg', 0):4.1f}% | "
+            f"{r.get('gpu_mem_peak', 0):6.0f}MB | "
+            f"{r.get('ram_avg', 0):4.1f}% | "
+            f"{r['tokens_per_request']:6.1f}"
+        )
 
     with open("results.csv","w",newline="") as f:
         writer = csv.DictWriter(f, fieldnames=results[0].keys())
