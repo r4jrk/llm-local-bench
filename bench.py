@@ -11,6 +11,7 @@ import requests
 from worker import run_single
 from aggregator import aggregate, score_quality
 from system_monitor import SystemMonitor
+from judge import judge_answer
 
 OLLAMA_URL = "http://localhost:11434/api/generate"
 
@@ -37,7 +38,7 @@ TIMEOUT = 600
 ARTIFACT_DIR = "artifacts"
 WARMUP_RUNS = 1
 COOLDOWN_SECONDS = 3
-
+JUDGE_MODEL = "qwen3-coder:latest" #This is actually important, to use strong model, not a small one.
 
 def check_ollama_available(url, retries=3, delay=1.0):
     for attempt in range(retries):
@@ -60,6 +61,29 @@ def worker_thread(q, results, model):
             break
         results.append(run_single(model, PROMPT, TIMEOUT))
         q.task_done()
+
+def run_judge_batch(model, runs):
+    scores = []
+
+    for r in runs:
+        if r.get("error") or not r.get("text"):
+            continue
+
+        try:
+            score = judge_answer(
+                JUDGE_MODEL,
+                PROMPT,
+                r["text"]
+            )
+            scores.append(score)
+        except Exception as e:
+            print(f"⚠️ Judge failed for {model}: {e}")
+
+    return scores
+
+def avg(scores, key):
+    vals = [s.get(key, 0) for s in scores if isinstance(s, dict)]
+    return sum(vals) / len(vals) if vals else 0
 
 def run_concurrent(model, requests, concurrency):
     q = Queue()
@@ -89,7 +113,7 @@ def run_sequential(model, requests):
         results.append(run_single(model, PROMPT, TIMEOUT))
     return results
 
-def run_all(mode, requests, concurrency):
+def run_all(mode, requests, concurrency, judge_enabled=False):
     all_results = []
 
     for model in MODELS:
@@ -134,11 +158,37 @@ def run_all(mode, requests, concurrency):
             stats["quality_score"] = score_quality(valid)
 
             stats["tokens_per_request"] = (
-                sum(r["tokens"] for r in valid) / len(valid)
+                    sum(r["tokens"] for r in valid) / len(valid)
             )
 
             stats["failed_runs"] = failed
             stats["total_runs"] = len(results)
+
+            if judge_enabled:
+                try:
+                    judge_scores = run_judge_batch(model, valid)
+                    ...
+                except Exception as e:
+                    print(f"⚠️ Judge failed for {model}: {e}")
+
+                stats["judge_correctness"] = avg(judge_scores, "correctness")
+                stats["judge_completeness"] = avg(judge_scores, "completeness")
+                stats["judge_clarity"] = avg(judge_scores, "clarity")
+                stats["judge_design"] = avg(judge_scores, "design")
+                stats["judge_overall"] = avg(judge_scores, "overall")
+
+                stats["judge_quality_score"] = (
+                        stats["judge_overall"] * 0.5 +
+                        stats["judge_completeness"] * 0.25 +
+                        stats["judge_correctness"] * 0.25
+                )
+            else:
+                stats["judge_correctness"] = None
+                stats["judge_completeness"] = None
+                stats["judge_clarity"] = None
+                stats["judge_design"] = None
+                stats["judge_overall"] = None
+                stats["judge_quality_score"] = None
 
             stats.update(sys_metrics)
             all_results.append(stats)
@@ -191,6 +241,10 @@ def save_artifacts(model, results, stats):
 
 
 def save_global_results(all_results):
+    if not all_results:
+        print("❌ No successful benchmark results. Skipping export.")
+        return
+
     os.makedirs("results", exist_ok=True)
 
     with open("results/results.json", "w") as f:
@@ -212,7 +266,7 @@ def save_global_results(all_results):
                 f"{r['model'][:28]:28} | "
                 f"{r['steady_tps_avg']:.1f} | "
                 f"{r['ttft_p50']:.2f} | "
-                f"{r['quality_score']:.2f} | "
+                f"{(r.get('judge_quality_score') or r.get('quality_score', 0)):.2f} | "
                 f"{r['tokens_per_request']:.1f}\n"
             )
 
@@ -230,14 +284,18 @@ def main():
     parser.add_argument("--mode", choices=["sequential","concurrent"], default="sequential")
     parser.add_argument("--requests", type=int, default=5)
     parser.add_argument("--concurrency", type=int, default=2)
+    parser.add_argument("--judge", action="store_true", help="Enable LLM-as-a-judge scoring")
+    parser.add_argument("--no-judge", action="store_true", help="Disable judge even if enabled elsewhere")
     args = parser.parse_args()
+
+    JUDGE_ENABLED = args.judge and not args.no_judge
 
     if not check_ollama_available(OLLAMA_URL):
         print("\n❌ Ollama is not running or not reachable at:", OLLAMA_URL)
         print("👉 Start it with: ollama serve")
         return
 
-    results = run_all(args.mode, args.requests, args.concurrency)
+    results = run_all(args.mode, args.requests, args.concurrency, JUDGE_ENABLED)
     save_global_results(results)
 
     results.sort(key=lambda x: x["steady_tps_avg"], reverse=True)
